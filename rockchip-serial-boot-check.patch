@@ -1,0 +1,287 @@
+diff --git a/drivers/misc/rockchip/Kconfig b/drivers/misc/rockchip/Kconfig
+index 3329c6cd9..68bdc626f 100644
+--- a/drivers/misc/rockchip/Kconfig
++++ b/drivers/misc/rockchip/Kconfig
+@@ -17,3 +17,23 @@ config PCIE_FUNC_RKEP_USERPAGES
+ 	help
+ 	  Enable this configuration option to reserve continuous physical space
+           for user layer in Rockchip's EP demo function driver.
++
++config ROCKCHIP_SERIAL_BOOT_CHECK
++	bool "Rockchip boot serial number check"
++	depends on ARCH_ROCKCHIP && OF && SYSFS
++	default y
++	help
++	  Enable this option to check a board serial number in kernel space at
++	  boot time.
++
++	  The driver reads the hardware serial number from device-tree
++	  (/chosen/serial-number, then /serial-number) and compares it with an
++	  expected serial string.
++
++	  Provide expected serial through kernel cmdline:
++	    rk_serial_check.expected_serial=<serial>
++
++	  Root can update the expected serial at runtime via:
++	    /sys/kernel/rk_serial_check/expected_serial
++
++	  Writes are restricted to CAP_SYS_ADMIN and a root-only sysfs mode.
+diff --git a/drivers/misc/rockchip/Makefile b/drivers/misc/rockchip/Makefile
+index 9affc803f..9f7680c21 100644
+--- a/drivers/misc/rockchip/Makefile
++++ b/drivers/misc/rockchip/Makefile
+@@ -4,4 +4,5 @@
+ #
+ 
+ obj-$(CONFIG_PCIE_FUNC_RKEP)	+= pcie-rkep.o
++obj-$(CONFIG_ROCKCHIP_SERIAL_BOOT_CHECK)	+= serial-boot-check.o
+ 
+diff --git a/drivers/misc/rockchip/serial-boot-check.c b/drivers/misc/rockchip/serial-boot-check.c
+new file mode 100644
+index 0000000..bad0d32
+--- /dev/null
++++ b/drivers/misc/rockchip/serial-boot-check.c
+@@ -0,0 +1,243 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include <linux/capability.h>
++#include <linux/cred.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/kobject.h>
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/sysfs.h>
++#include <linux/user_namespace.h>
++
++#define RK_SERIAL_MAX_LEN 64
++
++enum rk_serial_check_state {
++	RK_SERIAL_CHECK_UNCONFIGURED = 0,
++	RK_SERIAL_CHECK_PASS,
++	RK_SERIAL_CHECK_FAIL,
++	RK_SERIAL_CHECK_NO_HW_SERIAL,
++};
++
++static char expected_serial[RK_SERIAL_MAX_LEN];
++static bool enforce_fail;
++
++module_param_string(expected_serial, expected_serial, sizeof(expected_serial), 0600);
++MODULE_PARM_DESC(expected_serial,
++	"Expected board serial (compare with DT /chosen/serial-number or /serial-number)");
++module_param_named(enforce, enforce_fail, bool, 0600);
++MODULE_PARM_DESC(enforce,
++	"Panic on serial mismatch at boot (default: false)");
++
++static DEFINE_MUTEX(rk_serial_lock);
++static struct kobject *rk_serial_kobj;
++static char hw_serial[RK_SERIAL_MAX_LEN];
++static enum rk_serial_check_state rk_check_state = RK_SERIAL_CHECK_UNCONFIGURED;
++
++static bool rk_serial_is_privileged_writer(void)
++{
++	if (!uid_eq(current_euid(), GLOBAL_ROOT_UID))
++		return false;
++
++	return ns_capable(&init_user_ns, CAP_SYS_ADMIN);
++}
++
++static int rk_get_hw_serial(char *out, size_t out_len)
++{
++	struct device_node *np;
++	const char *serial = NULL;
++	int ret;
++
++	np = of_find_node_by_path("/chosen");
++	if (np) {
++		ret = of_property_read_string(np, "serial-number", &serial);
++		of_node_put(np);
++		if (!ret && serial && *serial) {
++			strscpy(out, serial, out_len);
++			return 0;
++		}
++	}
++
++	np = of_find_node_by_path("/");
++	if (np) {
++		ret = of_property_read_string(np, "serial-number", &serial);
++		of_node_put(np);
++		if (!ret && serial && *serial) {
++			strscpy(out, serial, out_len);
++			return 0;
++		}
++	}
++
++	return -ENOENT;
++}
++
++static void rk_eval_serial_locked(void)
++{
++	if (!hw_serial[0]) {
++		rk_check_state = RK_SERIAL_CHECK_NO_HW_SERIAL;
++		return;
++	}
++
++	if (!expected_serial[0]) {
++		rk_check_state = RK_SERIAL_CHECK_UNCONFIGURED;
++		return;
++	}
++
++	if (!strcmp(hw_serial, expected_serial)) {
++		rk_check_state = RK_SERIAL_CHECK_PASS;
++		return;
++	}
++
++	rk_check_state = RK_SERIAL_CHECK_FAIL;
++}
++
++static const char *rk_state_to_str(enum rk_serial_check_state state)
++{
++	switch (state) {
++	case RK_SERIAL_CHECK_PASS:
++		return "pass";
++	case RK_SERIAL_CHECK_FAIL:
++		return "fail";
++	case RK_SERIAL_CHECK_NO_HW_SERIAL:
++		return "no-hw-serial";
++	case RK_SERIAL_CHECK_UNCONFIGURED:
++	default:
++		return "unconfigured";
++	}
++}
++
++static ssize_t expected_serial_show(struct kobject *kobj,
++				    struct kobj_attribute *attr,
++				    char *buf)
++{
++	ssize_t n;
++
++	mutex_lock(&rk_serial_lock);
++	n = scnprintf(buf, PAGE_SIZE, "%s\n", expected_serial);
++	mutex_unlock(&rk_serial_lock);
++	return n;
++}
++
++static ssize_t expected_serial_store(struct kobject *kobj,
++				     struct kobj_attribute *attr,
++				     const char *buf, size_t count)
++{
++	size_t len;
++
++	if (!rk_serial_is_privileged_writer())
++		return -EPERM;
++
++	len = strnlen(buf, RK_SERIAL_MAX_LEN);
++	if (!len)
++		return -EINVAL;
++
++	if (buf[len - 1] == '\n')
++		len--;
++
++	if (!len)
++		return -EINVAL;
++
++	mutex_lock(&rk_serial_lock);
++	memset(expected_serial, 0, sizeof(expected_serial));
++	strscpy(expected_serial, buf, min(len + 1, sizeof(expected_serial)));
++	rk_eval_serial_locked();
++	mutex_unlock(&rk_serial_lock);
++
++	return count;
++}
++
++static ssize_t hw_serial_show(struct kobject *kobj,
++			      struct kobj_attribute *attr,
++			      char *buf)
++{
++	ssize_t n;
++
++	mutex_lock(&rk_serial_lock);
++	n = scnprintf(buf, PAGE_SIZE, "%s\n", hw_serial[0] ? hw_serial : "");
++	mutex_unlock(&rk_serial_lock);
++	return n;
++}
++
++static ssize_t status_show(struct kobject *kobj,
++			  struct kobj_attribute *attr,
++			  char *buf)
++{
++	enum rk_serial_check_state state;
++
++	mutex_lock(&rk_serial_lock);
++	state = rk_check_state;
++	mutex_unlock(&rk_serial_lock);
++
++	return scnprintf(buf, PAGE_SIZE, "%s\n", rk_state_to_str(state));
++}
++
++static struct kobj_attribute expected_serial_attr =
++	__ATTR(expected_serial, 0600, expected_serial_show, expected_serial_store);
++static struct kobj_attribute hw_serial_attr =
++	__ATTR(hw_serial, 0444, hw_serial_show, NULL);
++static struct kobj_attribute status_attr =
++	__ATTR(status, 0444, status_show, NULL);
++
++static struct attribute *rk_serial_attrs[] = {
++	&expected_serial_attr.attr,
++	&hw_serial_attr.attr,
++	&status_attr.attr,
++	NULL,
++};
++
++static const struct attribute_group rk_serial_attr_group = {
++	.attrs = rk_serial_attrs,
++};
++
++static int __init rk_serial_check_init(void)
++{
++	int ret;
++	char tmp[RK_SERIAL_MAX_LEN] = { 0 };
++
++	rk_serial_kobj = kobject_create_and_add("rk_serial_check", kernel_kobj);
++	if (!rk_serial_kobj)
++		return -ENOMEM;
++
++	ret = sysfs_create_group(rk_serial_kobj, &rk_serial_attr_group);
++	if (ret) {
++		kobject_put(rk_serial_kobj);
++		rk_serial_kobj = NULL;
++		return ret;
++	}
++
++	mutex_lock(&rk_serial_lock);
++	if (!rk_get_hw_serial(tmp, sizeof(tmp)))
++		strscpy(hw_serial, tmp, sizeof(hw_serial));
++	rk_eval_serial_locked();
++
++	switch (rk_check_state) {
++	case RK_SERIAL_CHECK_PASS:
++		pr_info("rk_serial_check: serial check passed\n");
++		break;
++	case RK_SERIAL_CHECK_FAIL:
++		pr_err("rk_serial_check: serial check failed hw=%s expected=%s\n",
++		       hw_serial, expected_serial);
++		if (enforce_fail)
++			panic("rk_serial_check: enforced serial mismatch");
++		break;
++	case RK_SERIAL_CHECK_NO_HW_SERIAL:
++		pr_warn("rk_serial_check: hardware serial-number not found in DT\n");
++		break;
++	case RK_SERIAL_CHECK_UNCONFIGURED:
++	default:
++		pr_info("rk_serial_check: expected serial is not configured\n");
++		break;
++	}
++	mutex_unlock(&rk_serial_lock);
++
++	return 0;
++}
++late_initcall(rk_serial_check_init);
++
++MODULE_AUTHOR("Ubuntu Rockchip");
++MODULE_DESCRIPTION("Rockchip boot serial number checker");
++MODULE_LICENSE("GPL");

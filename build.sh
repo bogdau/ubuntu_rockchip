@@ -25,10 +25,38 @@ Optional arguments:
 HEREDOC
 }
 
+restore_build_ownership() {
+    local target_user target_group
+
+    if [ "$(id -u)" -ne 0 ]; then
+        return
+    fi
+
+    if [ "${KEEP_BUILD_ROOT_OWNERSHIP}" = "Y" ]; then
+        return
+    fi
+
+    target_user="${SUDO_USER}"
+    if [ -z "${target_user}" ] || [ "${target_user}" = "root" ]; then
+        return
+    fi
+
+    if ! id "${target_user}" > /dev/null 2>&1; then
+        return
+    fi
+
+    target_group="$(id -gn "${target_user}")"
+    if [ -d build ]; then
+        chown -R "${target_user}:${target_group}" build || true
+    fi
+}
+
 if [ "$(id -u)" -ne 0 ]; then 
     echo "Please run as root"
     exit 1
 fi
+
+trap restore_build_ownership EXIT
 
 cd "$(dirname -- "$(readlink -f -- "$0")")"
 
